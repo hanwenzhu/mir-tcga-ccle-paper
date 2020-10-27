@@ -1,0 +1,551 @@
+---
+title: "Preprocessing TCGA to CCLE"
+output: html_notebook
+---
+# Loading
+```{r}
+# setwd("~/Documents/PCP/Code")
+
+library(stringr)
+library(dplyr)
+library(edgeR)
+library(sva)
+```
+
+## CCLE
+```{r}
+# From https://data.broadinstitute.org/ccle/CCLE_miRNA_20181103.gct
+ccle.raw <- read.delim(
+  "CCLE_miRNA_20181103.gct",
+  row.names = 1,
+  check.names = FALSE,
+  skip = 2
+)
+# From https://data.broadinstitute.org/ccle/Cell_lines_annotations_20181226.txt
+ccle.annotations <- read.delim(
+  "Cell_lines_annotations_20181226.txt",
+  row.names = 1
+)
+```
+
+## TCGA
+(The following frames have formats different from above)
+```{r}
+# This is from download.R, ~3G memory
+tcga.raw <- readRDS(
+  "TCGA-isoform.rds"
+)
+# From https://gdc.cancer.gov/about-data/publications/pancanatlas
+# > PanCanAtlas_miRNA_sample_information_list.txt
+tcga.annotations <- read.delim(
+  "PanCanAtlas_miRNA_sample_information_list.txt",
+  row.names = 1
+)
+tcga.disease.original <- tcga.annotations$Disease
+tcga.annotations$Disease <- gsub("^(COAD|READ)$", "COAD/READ",
+                                 tcga.annotations$Disease)
+# From https://gdc.cancer.gov/about-data/publications/pancanatlas
+# > TCGA_mastercalls.abs_tables_JSedit.fixed.txt
+tcga.purity <- read.delim(
+   "TCGA_mastercalls.abs_tables_JSedit.fixed.txt",
+   row.names = 1
+)
+# From https://github.com/rptashkin/TCGA_miRNASeq_matrix/blob/master/hsa_miR_accessionTOname.txt
+mimat.to.id <- read.delim(
+  "hsa_miR_accessionTOname.txt",
+  row.names = 1
+)
+```
+
+## CCLE mRNA
+```{r}
+# From https://data.broadinstitute.org/ccle/CCLE_RNAseq_genes_counts_20180929.gct.gz
+ccle.mrna.raw.gz <- gzfile(
+  "CCLE_RNAseq_genes_counts_20180929.gct.gz",
+  open = "r"
+)
+ccle.mrna.raw <- read.delim(
+  ccle.mrna.raw.gz,
+  row.names = 1,
+  check.names = FALSE,
+  skip = 2
+)
+close(ccle.mrna.raw.gz)
+```
+
+## TCGA mRNA
+```{r}
+# From https://osf.io/gqrz9/
+tcga.barcode.table <- read.csv(
+  "TCGA_ID_MAP.csv"
+)
+tcga.barcode.map <- NULL
+for (i in 1:nrow(tcga.barcode.table)) {
+  tcga.barcode.map[as.character(tcga.barcode.table$CGHubAnalysisID[i])] <-
+    as.character(tcga.barcode.table$AliquotBarcode[i])
+}
+tcga.disease.map <- NULL
+for (i in 1:nrow(tcga.barcode.table)) {
+  tcga.disease.map[as.character(tcga.barcode.table$AliquotBarcode[i])] <-
+    gsub("^(COAD|READ)$", "COAD/READ",
+         as.character(tcga.barcode.table$Disease[i]))
+}
+```
+```{r}
+tcga.mrna.raw <- NULL
+for (disease in sort(unique(tcga.barcode.table$Disease))) {
+  print(paste("Reading", disease))
+  
+  # From https://osf.io/gqrz9/
+  tcga.mrna.disease.gz <- gzfile(
+    paste0("TCGA_", disease, "_counts.tsv.gz"),
+    open = "r"
+  )
+  tcga.mrna.disease.raw <- read.delim(
+    tcga.mrna.disease.gz,
+    row.names = 1,
+    check.names = FALSE
+  )
+  close(tcga.mrna.disease.gz)
+
+  if (is.null(tcga.mrna.raw)) {
+    tcga.mrna.raw <- tcga.mrna.disease.raw
+  } else {
+    tcga.mrna.raw <- cbind(tcga.mrna.raw, tcga.mrna.disease.raw)
+  }
+}
+```
+
+## Hallmark Gene Sets
+```{r}
+hallmark.names <- c(
+  "Angiogenesis",
+  "Apoptosis",
+  "DNA Repair",
+  "Epithelial Mesenchymal Transition",
+  "G2M Checkpoint",
+  "Hypoxia",
+  "IL2 STAT5 Signaling",
+  "IL6 JAK STAT3 Signaling",
+  "Inflammatory Response",
+  "KRAS Signaling Up",
+  "Oxidative Phosphorylation",
+  "PI3K AKT MTOR Signaling",
+  "Reactive Oxygen Species Pathway",
+  "TGF Beta Signaling",
+  "TNFa Signaling via NFKB",
+  "Xenobiotic Metabolism",
+  "p53 Pathway"
+)
+hallmark.down.raw <- list()
+hallmark.up.raw <- list()
+for (hallmark.name in hallmark.names) {
+  # Decompressed from
+  # https://github.com/andrewdhawan/miRNA_hallmarks_of_cancer/blob/master/Supplementary%20Information.zip
+  hallmark.down.raw[[hallmark.name]] <- rownames(read.delim(paste0(
+    "signature_associated_miRNA/miRNA_down/Hallmark: ",
+    hallmark.name,
+    "_miRNA_down.txt"
+  ), row.names = 1))
+  hallmark.up.raw[[hallmark.name]] <- rownames(read.delim(paste0(
+    "signature_associated_miRNA/miRNA_up/Hallmark: ",
+    hallmark.name,
+    "_miRNA_up.txt"
+  ), row.names = 1))
+}
+```
+
+## TargetScan
+```{r}
+# http://www.targetscan.org/cgi-bin/targetscan/data_download.vert72.cgi
+# > Predicted Targets context++ scores (default predictions)
+targetscan.raw <- read.delim(
+  "Predicted_Targets_Context_Scores.default_predictions.txt"
+)
+```
+
+# Mapping
+
+## CCLE
+```{r}
+# Only use hsa data
+ccle.mapped <- ccle.raw[
+  grepl("^hsa-", ccle.raw$Description),
+  # c(TRUE, !is.na(ccle.annotations[colnames(ccle.raw)[-1], "Pathology"]) &
+  #   ccle.annotations[colnames(ccle.raw)[-1], "Pathology"] == "primary")
+]
+rownames(ccle.mapped) <- ccle.mapped$Description
+ccle.mapped <- ccle.mapped[, -1]
+saveRDS(ccle.mapped, file = "CCLE-mapped.rds")
+```
+
+## TCGA
+```{r}
+mirna.regex <- "^hsa-(let|miR)-([0-9]+)([a-z]+)?(-[0-9]+)?(-[35]p)?$"
+
+tcga.to.ccle <- function(sample, mirna.id, sample.components) {
+  if (grepl("[+]", mirna.id)) {
+    processed <- 0
+    for (sub.id in unlist(strsplit(mirna.id, "[+]"))) {
+      processed <- processed + tcga.to.ccle(sample, sub.id, sample.components)
+    }
+    return(processed)
+  } else {
+    components <- str_match(mirna.id, mirna.regex)[1, -1]
+    filtered <- sample
+    filtered.components <- sample.components
+    for (i in 1:length(components)) {
+      if (nrow(filtered) == 0) {
+        break
+      }
+      filter.index <- is.na(components[i]) |
+        (!is.na(filtered.components[, i]) &
+           filtered.components[, i] == components[i])
+      filtered <- filtered[filter.index, ]
+      filtered.components <- filtered.components[filter.index, ]
+    }
+    return(sum(filtered$read_count))
+  }
+}
+
+tcga.mapped <- data.frame(row.names = rownames(ccle.mapped))
+for (sample.barcode in unique(tcga.raw$barcode)) {
+  print(sample.barcode)
+  sample <- tcga.raw %>%
+    filter(barcode == sample.barcode) %>%
+    filter(grepl("^mature,", miRNA_region) | miRNA_region == "precursor")
+  mature.index <- grepl("^mature,", sample$miRNA_region)
+  mature.regions <- sample$miRNA_region[mature.index] %>% substr(8, 19)
+  mature.ids <- mimat.to.id[mature.regions, ] %>% as.vector()
+  sample$strand <- sample$miRNA_ID
+  sample$strand[mature.index] <- mature.ids
+  sample$strand <- gsub("mir", "miR", sample$strand)
+  sample.components <- str_match(sample$strand, mirna.regex)
+  sample.components <- as_tibble(sample.components[, -1],
+                                 .name_repair = "minimal")
+  for (mirna.id in rownames(ccle.mapped)) {
+    tcga.mapped[mirna.id, sample.barcode] <- tcga.to.ccle(
+      sample,
+      mirna.id,
+      sample.components
+    )
+  }
+}
+
+saveRDS(tcga.mapped, file = "TCGA-mapped.rds")
+```
+
+## CCLE mRNA
+```{r}
+ccle.mrna.mapped <- ccle.mrna.raw[, -1]
+
+raw.rows <- str_match(rownames(ccle.mrna.raw), "ENSG[0-9R][0-9]{10}")
+rownames(ccle.mrna.mapped) <- raw.rows
+ccle.mrna.mapped <- ccle.mrna.mapped[
+  rownames(ccle.mrna.mapped) %in% colnames(targetscan.matrix),
+]
+
+saveRDS(ccle.mrna.mapped, "CCLE-mRNA-mapped.rds")
+```
+
+## TCGA mRNA
+```{r}
+raw.rows <- str_match(rownames(tcga.mrna.raw), "ENSG[0-9R][0-9]{10}")
+genes <- unique(raw.rows)
+barcodes <- tcga.barcode.map[
+  gsub("\\.", "-", colnames(tcga.mrna.raw))
+]
+tcga.mrna.mapped <- matrix(nrow = length(genes), ncol = length(barcodes),
+                           dimnames = list(genes, barcodes))
+for (gene in genes) {
+  tcga.mrna.mapped[gene, ] <- colSums(tcga.mrna.raw[raw.rows == gene, ])
+}
+
+tcga.mrna.mapped <- tcga.mrna.mapped[
+  rownames(tcga.mrna.mapped) %in% colnames(targetscan.matrix),
+]
+
+saveRDS(tcga.mrna.mapped, "TCGA-mRNA-mapped.rds")
+```
+
+## Hallmark Gene Sets
+```{r}
+mirna.regex <- "^hsa-(let|miR)-([0-9]+)([a-z]+)?(-[0-9]+)?(-[35]p)?$"
+
+map.hallmark <- function(hallmark.raw) {
+  hallmark.mapped <- list()
+  for (hallmark.name in hallmark.names) {
+    for (hallmark.gene in hallmark.raw[[hallmark.name]]) {
+      components <- str_match(hallmark.gene, mirna.regex)[1, -1]
+      matched.id <- NULL
+      for (mirna.id in rownames(ccle.normalized)) {
+        if (grepl("[+]", mirna.id)) {
+          # TODO
+          next
+        }
+        mirna.components <- str_match(mirna.id, mirna.regex)[1, -1]
+        if (all(is.na(mirna.components) | is.na(components) |
+                mirna.components == components)) {
+          matched.id <- c(matched.id, mirna.id)
+        }
+      }
+      stopifnot(length(matched.id) %in% c(0, 1))
+      if (length(matched.id) == 1) {
+        hallmark.mapped[[hallmark.name]] <- unique(c(
+          hallmark.mapped[[hallmark.name]], matched.id[1]
+        ))
+      }
+    }
+  }
+  return(hallmark.mapped)
+}
+
+hallmark.down.mapped <- map.hallmark(hallmark.down.raw)
+saveRDS(hallmark.down.mapped, file = "hallmark-down-mapped.rds")
+hallmark.up.mapped <- map.hallmark(hallmark.up.raw)
+saveRDS(hallmark.up.mapped, file = "hallmark-up-mapped.rds")
+```
+
+## TargetScan
+```{r}
+# Keep only: human; 7mer/8mer; top 40% score
+targetscan.filtered <- targetscan.raw %>%
+  filter(grepl("^hsa-", miRNA) &
+           Site.Type %in% 1:3 &
+           weighted.context...score.percentile >= 60) %>%
+  transmute(mrna = sub("\\.[0-9]+$", "", Gene.ID),
+            mirna = miRNA)
+
+mirna.regex <- "^hsa-(let|miR)-([0-9]+)([a-z]+)?(-[0-9]+)?(-[35]p)?(\\.[0-9]+)?$"
+
+targetscan.mapped <- targetscan.filtered
+targetscan.mapped$mirna <- as.character(targetscan.mapped$mirna)
+for (targetscan.gene in unique(targetscan.mapped$mirna)) {
+  components <- str_match(targetscan.gene, mirna.regex)[1, -1]
+  matched.id <- NULL
+  for (mirna.id in rownames(ccle.normalized)) {
+    if (grepl("[+]", mirna.id)) {
+      # TODO
+      next
+    }
+    mirna.components <- str_match(mirna.id, mirna.regex)[1, -1]
+    if (all(is.na(mirna.components) | is.na(components) |
+            mirna.components == components)) {
+      matched.id <- c(matched.id, mirna.id)
+    }
+  }
+
+  if (length(matched.id) == 2) {
+    stopifnot(targetscan.gene %in% matched.id)
+    matched.id <- targetscan.gene
+  }
+  stopifnot(length(matched.id) %in% c(0, 1))
+  replace.index <- which(targetscan.mapped$mirna == targetscan.gene)
+  if (length(matched.id) == 1) {
+    targetscan.mapped[replace.index, "mirna"] <- matched.id[1]
+  } else if (length(matched.id) == 0) {
+    targetscan.mapped <- targetscan.mapped[-replace.index, ]
+  }
+}
+
+saveRDS(targetscan.mapped, file = "TargetScan-mapped.rds")
+```
+```{r}
+targetscan.matrix <- matrix( 
+  data = 0,
+  nrow = length(unique(targetscan.mapped$mirna)),
+  ncol = length(unique(targetscan.mapped$mrna)),
+  dimnames = list(unique(targetscan.mapped$mirna),
+                  unique(targetscan.mapped$mrna))
+)
+for (i in 1:nrow(targetscan.mapped)) {
+  targetscan.matrix[targetscan.mapped$mirna[i], targetscan.mapped$mrna[i]] <- 1
+}
+saveRDS(targetscan.matrix, file = "TargetScan-matrix.rds")
+```
+
+# Normalization
+
+## miRNA
+```{r}
+# TMM & logCPM
+dge <- DGEList(ccle.mapped)
+dge <- calcNormFactors(dge, method = "TMM")
+ccle.normalized <- cpm(dge, log = TRUE)
+
+dge <- DGEList(tcga.mapped)
+dge <- calcNormFactors(dge, method = "TMM")
+tcga.normalized <- cpm(dge, log = TRUE)
+
+# Filtering
+filter.genes <- union(which(apply(ccle.normalized, 1, IQR) == 0 |
+                              apply(ccle.normalized, 1, sum) <= 1),
+                      which(apply(tcga.normalized, 1, IQR) == 0 |
+                              apply(tcga.normalized, 1, sum) <= 1))
+ccle.normalized <- ccle.normalized[-filter.genes, ]
+tcga.normalized <- tcga.normalized[-filter.genes, ]
+
+saveRDS(ccle.normalized, file = "CCLE-normalized.rds")
+saveRDS(tcga.normalized, file = "TCGA-normalized.rds")
+```
+
+## mRNA
+```{r}
+# TMM & logCPM
+dge <- DGEList(ccle.mrna.mapped)
+dge <- calcNormFactors(dge, method = "TMM")
+ccle.mrna.normalized <- cpm(dge, log = TRUE)
+
+dge <- DGEList(tcga.mrna.mapped)
+dge <- calcNormFactors(dge, method = "TMM")
+tcga.mrna.normalized <- cpm(dge, log = TRUE)
+
+# Filtering
+keep.genes <- intersect(
+  rownames(ccle.mrna.normalized)[
+    apply(ccle.mrna.normalized, 1, IQR) > 0 &
+      apply(ccle.mrna.normalized, 1, sum) > 1
+  ],
+  rownames(tcga.mrna.normalized)[
+    apply(tcga.mrna.normalized, 1, IQR) > 0 &
+      apply(tcga.mrna.normalized, 1, sum) > 1
+  ]
+)
+ccle.mrna.normalized <- ccle.mrna.normalized[keep.genes, ]
+tcga.mrna.normalized <- tcga.mrna.normalized[keep.genes, ]
+
+saveRDS(ccle.mrna.normalized, file = "CCLE-mRNA-normalized.rds")
+saveRDS(tcga.mrna.normalized, file = "TCGA-mRNA-normalized.rds")
+```
+
+# Batch Correction
+
+## TCGA
+Some (258) `tcga.normalized` samples are not in `tcga.annotations`, but all samples in `tcga.annotations` are in `tcga.normalized`.
+```{r}
+tcga.corrected <- tcga.normalized[, colnames(tcga.normalized) %in%
+                                    rownames(tcga.annotations)]
+for (disease in unique(tcga.annotations$Disease)) {
+  samples <- tcga.annotations[tcga.annotations$Disease == disease, ]
+  if (length(unique(samples$Platform)) == 1) {
+    next
+  }
+  if (length(unique(samples$Sample_Type)) == 1) {
+    type.matrix <- model.matrix(~1, data = samples)
+  } else {
+    type.matrix <- model.matrix(~as.character(Sample_Type), data = samples)
+  }
+  tcga.corrected[, rownames(samples)] <- ComBat(
+    tcga.corrected[, rownames(samples)],
+    samples$Platform,
+    mod = type.matrix
+  )
+}
+saveRDS(tcga.corrected, "TCGA-corrected.rds")
+```
+
+## TCGA mRNA
+```{r}
+annotated.barcodes.short <- intersect(
+  substr(colnames(tcga.mrna.normalized), 1, 15),
+  substr(rownames(tcga.annotations), 1, 15)
+)
+tcga.mrna.corrected <- tcga.mrna.normalized[
+  , substr(colnames(tcga.mrna.normalized), 1, 15) %in% annotated.barcodes.short]
+tcga.mrna.annotations <- tcga.annotations[
+  substr(rownames(tcga.annotations), 1, 15) %in% annotated.barcodes.short, ]
+
+tcga.mrna.annotations$barcodes.duplicate <- colnames(tcga.mrna.normalized)[
+  match(substr(rownames(tcga.mrna.annotations), 1, 15),
+        substr(colnames(tcga.mrna.normalized), 1, 15))
+]
+barcode.count <- table(tcga.mrna.annotations$barcodes.duplicate)
+tcga.mrna.annotations <- tcga.mrna.annotations[
+  -match(names(barcode.count)[barcode.count > 1],
+         tcga.mrna.annotations$barcodes.duplicate), ]
+rownames(tcga.mrna.annotations) <- tcga.mrna.annotations$barcodes.duplicate
+```
+```{r}
+for (disease in unique(tcga.mrna.annotations$Disease)) {
+  samples <- tcga.mrna.annotations[tcga.mrna.annotations$Disease == disease, ]
+  if (length(unique(samples$Platform)) == 1) {
+    next
+  }
+  if (length(unique(samples$Sample_Type)) == 1) {
+    type.matrix <- model.matrix(~1, data = samples)
+  } else {
+    type.matrix <- model.matrix(~as.character(Sample_Type), data = samples)
+  }
+  tcga.mrna.corrected[, rownames(samples)] <- ComBat(
+    tcga.mrna.corrected[, rownames(samples)],
+    samples$Platform,
+    mod = type.matrix
+  )
+}
+saveRDS(tcga.mrna.corrected, "TCGA-mRNA-corrected.rds")
+```
+
+# Purity Adjustment
+
+## TCGA
+Full barcode names in `tcga.purity$sample` are incosistent with `colnames(tcga.corrected)`, so we'll only use the first 15 characters for matching. Only 9693 of 10824 samples have purity values in `tcga.purity`. The 5 samples of GBM all lack purity values, so the original batch corrected values are used, which means there are 9698 samples in `tcga.adjusted`.
+```{r}
+tcga.purity.cleaned <- tcga.purity[!is.na(tcga.purity$purity), ]
+tcga.adjusted <- data.frame(row.names = rownames(tcga.corrected))
+for (disease in unique(tcga.annotations$Disease)) {
+  samples.barcode <- rownames(
+    tcga.annotations[tcga.annotations$Disease == disease &
+      rownames(tcga.annotations) %>% substr(1, 15) %in%
+      rownames(tcga.purity.cleaned), ]
+  )
+  if (length(samples.barcode) == 0) {
+    samples.barcode <- rownames(
+      tcga.annotations[tcga.annotations$Disease == disease, ]
+    )
+    samples <- tcga.corrected[, samples.barcode]
+    tcga.adjusted[, samples.barcode] <- samples
+    next
+  }
+  samples <- tcga.corrected[, samples.barcode]
+  samples.purity <- tcga.purity.cleaned[samples.barcode %>% substr(1, 15), ]
+  samples.purity$impurity <- 1 - samples.purity$purity
+  impurity.matrix <- model.matrix(~impurity, data = samples.purity)
+  fit <- lmFit(samples, design = impurity.matrix)
+  tcga.adjusted[, samples.barcode] <- samples -
+    fit$coefficients[, "impurity"] %*% t(samples.purity$impurity)
+}
+tcga.adjusted <- as.matrix(tcga.adjusted)
+saveRDS(tcga.adjusted, file = "TCGA-adjusted.rds")
+```
+
+## TCGA mRNA
+Full barcode names in `tcga.purity$sample` are incosistent with `colnames(tcga.mrna.corrected)`, so we'll only use the first 15 characters for matching.
+```{r}
+tcga.purity.cleaned <- tcga.purity[!is.na(tcga.purity$purity), ]
+tcga.mrna.adjusted <- data.frame(row.names = rownames(tcga.mrna.corrected))
+for (disease in unique(tcga.mrna.annotations$Disease)) {
+  samples.barcode <- rownames(
+    tcga.mrna.annotations[tcga.mrna.annotations$Disease == disease &
+      rownames(tcga.mrna.annotations) %>% substr(1, 15) %in%
+      rownames(tcga.purity.cleaned), ]
+  )
+  if (length(samples.barcode) == 0) {
+    print(paste("Disease", disease, "has no purity values"))
+    samples.barcode <- rownames(
+      tcga.mrna.annotations[tcga.mrna.annotations$Disease == disease, ]
+    )
+    samples <- tcga.mrna.corrected[, samples.barcode]
+    tcga.mrna.adjusted[, samples.barcode] <- samples
+    next
+  }
+  samples <- tcga.mrna.corrected[, samples.barcode]
+  samples.purity <- tcga.purity.cleaned[samples.barcode %>% substr(1, 15), ]
+  samples.purity$impurity <- 1 - samples.purity$purity
+  impurity.matrix <- model.matrix(~impurity, data = samples.purity)
+  fit <- lmFit(samples, design = impurity.matrix)
+  tcga.mrna.adjusted[, samples.barcode] <- samples -
+    fit$coefficients[, "impurity"] %*% t(samples.purity$impurity)
+}
+tcga.mrna.adjusted <- as.matrix(tcga.mrna.adjusted)
+saveRDS(tcga.mrna.adjusted, file = "TCGA-mRNA-adjusted.rds")
+```

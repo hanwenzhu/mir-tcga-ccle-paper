@@ -1,0 +1,1263 @@
+---
+title: "Comparison between CCLE and TCGA"
+output:
+  html_document:
+    df_print: paged
+---
+
+# Loading
+```{r}
+library(dplyr)
+library(ggplot2)
+library(Rtsne)
+library(GSVA)
+library(reshape2)
+library(pheatmap)
+library(viridis)
+library(igraph)
+library(GGally)
+```
+
+# Reading Data
+The RDS files below are from preprocessing.Rmd.
+
+## CCLE
+```{r}
+ccle.mapped <- readRDS(
+  "CCLE-mapped.rds"
+)
+ccle.normalized <- readRDS(
+  "CCLE-normalized.rds"
+)
+# From https://data.broadinstitute.org/ccle/Cell_lines_annotations_20181226.txt
+ccle.annotations <- read.delim(
+  "Cell_lines_annotations_20181226.txt",
+  row.names = 1
+)
+```
+
+## TCGA
+(The following frames have formats different from above)
+```{r}
+tcga.mapped <- readRDS(
+  "TCGA-mapped.rds"
+)
+tcga.normalized <- readRDS(
+  "TCGA-normalized.rds"
+)
+tcga.corrected <- readRDS(
+  "TCGA-corrected.rds"
+)
+tcga.adjusted <- readRDS(
+  "TCGA-adjusted.rds"
+)
+# From https://gdc.cancer.gov/about-data/publications/pancanatlas > PanCanAtlas_miRNA_sample_information_list.txt
+tcga.annotations <- read.delim(
+  "PanCanAtlas_miRNA_sample_information_list.txt",
+  row.names = 1
+)
+tcga.disease.original <- tcga.annotations$Disease
+tcga.annotations$Disease <- gsub("^(COAD|READ)$", "COAD/READ",
+                                 tcga.annotations$Disease)
+```
+
+## CCLE mRNA
+```{r}
+ccle.mrna.normalized <- readRDS("CCLE-mRNA-normalized.rds")
+```
+
+## TCGA mRNA
+```{r}
+tcga.mrna.adjusted <- readRDS("TCGA-mRNA-adjusted.rds")
+
+# From https://osf.io/gqrz9/
+tcga.barcode.table <- read.csv(
+  "TCGA_ID_MAP.csv"
+)
+tcga.barcode.map <- NULL
+for (i in 1:nrow(tcga.barcode.table)) {
+  tcga.barcode.map[as.character(tcga.barcode.table$CGHubAnalysisID[i])] <-
+    as.character(tcga.barcode.table$AliquotBarcode[i])
+}
+tcga.disease.map <- NULL
+for (i in 1:nrow(tcga.barcode.table)) {
+  tcga.disease.map[as.character(tcga.barcode.table$AliquotBarcode[i])] <-
+    gsub("^(COAD|READ)$", "COAD/READ",
+         as.character(tcga.barcode.table$Disease[i]))
+}
+```
+
+## Hallmark Gene Sets
+```{r}
+hallmark.down.mapped <- readRDS(
+  "hallmark-down-mapped.rds"
+)
+hallmark.up.mapped <- readRDS(
+  "hallmark-up-mapped.rds"
+)
+```
+
+## TargetScan
+```{r}
+targetscan.matrix <- readRDS("TargetScan-matrix.rds")
+```
+
+# Overview
+Both contain miRNA cell lines for BLCA, BRCA, COAD/READ, DLBC, ESCA, GBM, HNSC, KIRC, LAML, LGG, LIHC, LUAD, LUSC, MESO, OV, PAAD, PRAD, SARC, SKCM, STAD, THCA, UCEC (22 in total).
+```{r}
+ccle.annotations$tcga.code.ordered <- factor(
+  ccle.annotations$tcga_code,
+  levels = names(sort(table(ccle.annotations$tcga_code), decreasing = TRUE))
+)
+p <- ggplot(data = ccle.annotations) +
+  geom_bar(mapping = aes(x = tcga.code.ordered)) +
+  theme_bw() +
+  theme(plot.title = element_text(size = 12, hjust = 0.5),
+        axis.text.x = element_text(size = 10,
+                                   angle = 90, vjust = 0.5, hjust = 1)) +
+  labs(x = NULL, y = "Count", title = "CCLE samples grouped by tumor type")
+if (!dir.exists("plots/counts")) {
+  dir.create("plots/counts", recursive = TRUE)
+}
+pdf("plots/counts/CCLE.pdf")
+print(p)
+dev.off()
+p
+```
+```{r}
+tcga.annotations$disease.ordered <- factor(
+  tcga.annotations$Disease,
+  levels = names(sort(table(tcga.annotations$Disease), decreasing = TRUE))
+)
+p <- ggplot(data = tcga.annotations) +
+  geom_bar(mapping = aes(x = disease.ordered)) +
+  scale_y_continuous(labels = function(x) format(x, big.mark = ",",
+                                                 scientific = FALSE)) +
+  theme_bw() +
+  theme(plot.title = element_text(size = 12, hjust = 0.5),
+        axis.text.x = element_text(size = 10,
+                                   angle = 90, vjust = 0.5, hjust = 1)) +
+  labs(x = NULL, y = "Count", title = "TCGA samples grouped by tumor type")
+if (!dir.exists("plots/counts")) {
+  dir.create("plots/counts", recursive = TRUE)
+}
+pdf("plots/counts/TCGA.pdf")
+print(p)
+dev.off()
+p
+```
+
+# Dimension Reduction
+```{r}
+tsne <- function(x, name, labels = NULL, text.labels = labels,
+                 title.size = 10, label.size = 2,
+                 axis.text.size = 7, axis.title.size = 7,
+                 legend.text.size = 5, legend.title.size = 7,
+                 dot.size = 1, legend.title = NULL,
+                 axis.title.x = NULL, axis.title.y = NULL,
+                 title = NULL, subtitle = NULL,
+                 caption = NULL, tag = NULL) {
+  result <- Rtsne(t(as.matrix(x)), dims = 2, perplexity = 15,
+                  verbose = FALSE, max_iter = 500)
+  scores <- data.frame(result$Y)
+  scores$label <- labels
+  centers <- scores %>% group_by(label) %>%
+    summarize(x = median(X1), y = median(X2))
+  centers$label <- ifelse(centers$label %in% text.labels, centers$label, "")
+  p <- ggplot(data = scores, aes(x = X1, y = X2)) +
+    geom_point(mapping = aes(color = label), size = dot.size) +
+    geom_text(data = centers, aes(x = x, y = y, label = label),
+              size = label.size) +
+    coord_fixed(ratio = 1) +
+    theme_bw() +
+    theme(plot.title = element_text(size = title.size, hjust = 0.5),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          axis.text.y = element_text(size = axis.text.size),
+          axis.text.x = element_text(size = axis.text.size),
+          axis.title.x = element_text(size = axis.title.size),
+          axis.title.y = element_text(size = axis.title.size),
+          legend.title = element_text(size = legend.title.size),
+          legend.title.align = 0.5,
+          legend.text = element_text(size = legend.text.size)) +
+    labs(color = legend.title,
+         x = axis.title.x, y = axis.title.y,
+         title = title, subtitle = subtitle,
+         caption = caption, tag = tag)
+  if (!dir.exists("plots/tSNE")) {
+    dir.create("plots/tSNE", recursive = TRUE)
+  }
+  pdf(paste0("plots/tSNE/", name, ".pdf"))
+  print(p)
+  dev.off()
+  return(p)
+}
+```
+
+## CCLE Normalized
+```{r}
+tsne(
+  ccle.normalized,
+  "CCLE-normalized",
+  labels = gsub("^UNABLE TO CLASSIFY$", NA,
+                ccle.annotations[colnames(ccle.normalized), "tcga_code"]),
+  text.labels = c("ALL", "CLL", "DLBC", "LAML", "LCML", "MM", "NB", "SCLC",
+                  "SKCM", "COAD/READ", "BRCA", "KIRC", "PRAD", "ESCA"),
+  legend.title = "Tumor type",
+  title = "t-SNE of normalized CCLE miRNA expression"
+)
+```
+
+## TCGA Normalized
+```{r}
+tsne(
+  tcga.normalized,
+  "TCGA-normalized",
+  labels = tcga.annotations[colnames(tcga.normalized), "Disease"],
+  dot.size = .5,
+  legend.title = "Tumor type",
+  title = "t-SNE of normalized TCGA miRNA expression"
+)
+```
+
+## TCGA Batch Corrected
+```{r}
+tsne(
+  tcga.corrected,
+  "TCGA-corrected",
+  labels = tcga.annotations[colnames(tcga.corrected), "Disease"],
+  dot.size = .5,
+  legend.title = "Tumor type",
+  title = "t-SNE of batch-corrected TCGA miRNA expression"
+)
+```
+
+## TCGA Purity Adjusted
+```{r}
+tsne(
+  tcga.adjusted,
+  "TCGA-adjusted",
+  labels = tcga.annotations[colnames(tcga.adjusted), "Disease"],
+  dot.size = .5,
+  legend.title = "Tumor type",
+  title = "t-SNE of purity-adjusted TCGA miRNA expression"
+)
+```
+
+# Gene Set Enrichment
+
+## CCLE
+```{r}
+ccle.gsva.down <- gsva(ccle.normalized, hallmark.down.mapped,
+                       method = "ssgsea", mx.diff = TRUE)
+saveRDS(ccle.gsva.down, file = "CCLE-GSVA-down.rds")
+ccle.gsva.up <- gsva(ccle.normalized, hallmark.up.mapped,
+                     method = "ssgsea", mx.diff = TRUE)
+saveRDS(ccle.gsva.up, file = "CCLE-GSVA-up.rds")
+```
+
+## TCGA before Purity Adjustment
+```{r}
+tcga.before.gsva.down <- gsva(tcga.corrected, hallmark.down.mapped,
+                              method = "ssgsea", mx.diff = TRUE)
+saveRDS(tcga.before.gsva.down, file = "TCGA-corrected-GSVA-down.rds")
+tcga.before.gsva.up <- gsva(tcga.corrected, hallmark.up.mapped,
+                            method = "ssgsea", mx.diff = TRUE)
+saveRDS(tcga.before.gsva.up, file = "TCGA-corrected-GSVA-up.rds")
+```
+
+## TCGA after Purity Adjustment
+```{r}
+tcga.after.gsva.down <- gsva(tcga.adjusted, hallmark.down.mapped,
+                             method = "ssgsea", mx.diff = TRUE)
+saveRDS(tcga.after.gsva.down, file = "TCGA-adjusted-GSVA-down.rds")
+tcga.after.gsva.up <- gsva(tcga.adjusted, hallmark.up.mapped,
+                           method = "ssgsea", mx.diff = TRUE)
+saveRDS(tcga.after.gsva.up, file = "TCGA-adjusted-GSVA-up.rds")
+```
+
+## Per-Cancer t-Test
+```{r}
+ccle.gsva.down <- readRDS(
+  "CCLE-GSVA-down.rds"
+)
+ccle.gsva.up <- readRDS(
+  "CCLE-GSVA-up.rds"
+)
+tcga.before.gsva.down <- readRDS(
+  "TCGA-corrected-GSVA-down.rds"
+)
+tcga.before.gsva.up <- readRDS(
+  "TCGA-corrected-GSVA-up.rds"
+)
+tcga.after.gsva.down <- readRDS(
+  "TCGA-adjusted-GSVA-down.rds"
+)
+tcga.after.gsva.up <- readRDS(
+  "TCGA-adjusted-GSVA-up.rds"
+)
+```
+```{r}
+# scores1 and scores2: gene sets * samples
+# diseases1 and diseases2: vectors of cancer codes for the respective scores
+# Returns intersecting diseases * gene sets t-test values between the scores
+gene.sets.t.test <- function(scores1, scores2, diseases1, diseases2) {
+  combined <- as.data.frame(rbind(t(scores1), t(scores2)))
+  combined$dataset <- as.factor(c(rep("scores1", ncol(scores1)),
+                                  rep("scores2", ncol(scores2))))
+  diseases1 <- as.character(diseases1)
+  diseases2 <- as.character(diseases2)
+  intersect.diseases <- sort(intersect(diseases1, diseases2))
+  combined$disease <- c(diseases1, diseases2)
+  combined <- combined %>% filter(disease %in% intersect.diseases)
+  t.values <- data.frame(row.names = intersect.diseases)
+  for (intersect.disease in intersect.diseases) {
+    combined.disease <- combined %>% filter(disease == intersect.disease)
+    for (hallmark.name in names(hallmark.down.mapped)) {
+      t.value <- t.test(combined.disease[, hallmark.name] ~ dataset,
+                        data = combined.disease)$statistic
+      t.values[intersect.disease, hallmark.name] <- t.value
+    }
+  }
+  return(as.matrix(t.values))
+}
+
+ccle.diseases <- ccle.annotations[colnames(ccle.normalized), "tcga_code"]
+tcga.before.diseases <- tcga.annotations[colnames(tcga.corrected), "Disease"]
+tcga.after.diseases <- tcga.annotations[colnames(tcga.adjusted), "Disease"]
+ccle.before.gsva.down <- gene.sets.t.test(
+  ccle.gsva.down, tcga.before.gsva.down,
+  ccle.diseases, tcga.before.diseases
+)
+saveRDS(ccle.before.gsva.down, file = "GSVA-CCLE-before-down.rds")
+ccle.before.gsva.up <- gene.sets.t.test(
+  ccle.gsva.up, tcga.before.gsva.up,
+  ccle.diseases, tcga.before.diseases
+)
+saveRDS(ccle.before.gsva.up, file = "GSVA-CCLE-before-up.rds")
+ccle.after.gsva.down <- gene.sets.t.test(
+  ccle.gsva.down, tcga.after.gsva.down,
+  ccle.diseases, tcga.after.diseases
+)
+saveRDS(ccle.after.gsva.down, file = "GSVA-CCLE-after-down.rds")
+ccle.after.gsva.up <- gene.sets.t.test(
+  ccle.gsva.up, tcga.after.gsva.up,
+  ccle.diseases, tcga.after.diseases
+)
+saveRDS(ccle.after.gsva.up, file = "GSVA-CCLE-after-up.rds")
+before.after.gsva.down <- gene.sets.t.test(
+  tcga.before.gsva.down, tcga.after.gsva.down,
+  tcga.before.diseases, tcga.after.diseases
+)
+saveRDS(before.after.gsva.down, file = "GSVA-before-after-down.rds")
+before.after.gsva.up <- gene.sets.t.test(
+  tcga.before.gsva.up, tcga.after.gsva.up,
+  tcga.before.diseases, tcga.after.diseases
+)
+saveRDS(before.after.gsva.up, file = "GSVA-before-after-up.rds")
+```
+
+### Heatmap
+```{r}
+gsva.heatmap <- function(x, name, scale.row = FALSE,
+                         title.size = 10,
+                         axis.text.size = 7, axis.title.size = 10,
+                         legend.text.size = 7, legend.title.size = 7,
+                         axis.title.x = NULL, axis.title.y = NULL,
+                         title = NULL, subtitle = NULL,
+                         caption = NULL, tag = NULL,
+                         legend.title = NULL) {
+  if (scale.row) {
+    x <- (x - apply(x, 1, mean)) / apply(x, 1, sd)
+  }
+  x <- x[rev(order(rownames(x))), order(colMeans(x))]
+  melted <- melt(as.matrix(x))
+  p <- ggplot(data = melted, aes(x = Var2, y = Var1)) +
+    geom_tile(aes(fill = value)) +
+    scale_fill_gradient2(low = "blue", mid = "white", high = "red",
+                         midpoint = 0) +
+    coord_equal() +
+    theme_bw() +
+    theme(plot.title = element_text(size = title.size, hjust = 0.5),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.border = element_blank(),
+          axis.line = element_blank(),
+          axis.ticks.x = element_blank(),
+          axis.ticks.y = element_blank(),
+          axis.text.x = element_text(size = axis.text.size,
+                                     angle = 90, vjust = 0.5, hjust = 1),
+          axis.text.y = element_text(size = axis.text.size),
+          axis.title.x = element_text(size = axis.title.size),
+          axis.title.y = element_text(size = axis.title.size),
+          legend.title = element_text(size = legend.title.size),
+          legend.title.align = 0.5,
+          legend.text = element_text(size = legend.text.size)) +
+    labs(x = axis.title.x, y = axis.title.y,
+         title = title, subtitle = subtitle,
+         caption = caption, tag = tag,
+         fill = legend.title)
+  if (!dir.exists("plots/GSVA")) {
+    dir.create("plots/GSVA", recursive = TRUE)
+  }
+  pdf(paste0("plots/GSVA/", name, ".pdf"))
+  print(p)
+  dev.off()
+  return(p)
+}
+```
+
+#### CCLE vs. TCGA before purity adjustment
+
+##### Downregulation
+```{r}
+ccle.before.gsva.down <- readRDS(
+  "GSVA-CCLE-before-down.rds"
+)
+gsva.heatmap(
+  ccle.before.gsva.down,
+  "CCLE-before-down",
+  title = "Hallmark downregulation ssGSEA between CCLE and TCGA before purity adjustment"
+)
+```
+
+##### Upregulation
+```{r}
+ccle.before.gsva.up <- readRDS(
+  "GSVA-CCLE-before-up.rds"
+)
+gsva.heatmap(
+  ccle.before.gsva.up,
+  "CCLE-before-up",
+  title = "Hallmark upregulation ssGSEA between CCLE and TCGA before purity adjustment"
+)
+```
+
+#### CCLE vs. TCGA after purity adjustment
+
+##### Downregulation
+```{r}
+ccle.after.gsva.down <- readRDS(
+  "GSVA-CCLE-after-down.rds"
+)
+gsva.heatmap(
+  ccle.after.gsva.down,
+  "CCLE-after-down",
+  title = "Hallmark downregulation ssGSEA between CCLE and purity-adjusted TCGA"
+)
+```
+
+##### Upregulation
+```{r}
+ccle.after.gsva.up <- readRDS(
+  "GSVA-CCLE-after-up.rds"
+)
+gsva.heatmap(
+  ccle.after.gsva.up,
+  "CCLE-after-up",
+  title = "Hallmark upregulation ssGSEA between CCLE and purity-adjusted TCGA"
+)
+```
+
+#### TCGA before vs. after purity adjustment
+
+##### Downregulation
+```{r}
+before.after.gsva.down <- readRDS(
+  "GSVA-before-after-down.rds"
+)
+gsva.heatmap(
+  before.after.gsva.down,
+  "before-after-down",
+  title = "Hallmark downregulation ssGSEA of TCGA before and after purity adjustment"
+)
+```
+
+##### Upregulation
+```{r}
+before.after.gsva.up <- readRDS(
+  "GSVA-before-after-up.rds"
+)
+gsva.heatmap(
+  before.after.gsva.up,
+  "before-after-up",
+  title = "Hallmark upregulation ssGSEA of TCGA before and after purity adjustment"
+)
+```
+
+# Correlation
+
+## Median Spearman Correlation
+```{r}
+median.correlation <- function(adjusted = TRUE) {
+  if (adjusted) {
+    tcga.data <- tcga.adjusted
+  } else {
+    tcga.data <- tcga.corrected
+  }
+
+  correlation <- cor(cbind(ccle.normalized, tcga.data), method = "spearman")
+  correlation <- correlation[colnames(ccle.normalized), colnames(tcga.data)]
+  
+  return(correlation)
+}
+```
+```{r}
+ccle.before.correlation <- median.correlation(adjusted = FALSE)
+saveRDS(ccle.before.correlation, file = "correlation-CCLE-before.rds")
+
+ccle.after.correlation <- median.correlation(adjusted = TRUE)
+saveRDS(ccle.after.correlation, file = "correlation-CCLE-after.rds")
+```
+
+## Per Disease
+```{r}
+correlate.disease <- function(disease, adjusted = TRUE) {
+  disease.dir <- paste0("plots/correlation/per-disease/",
+                        gsub("/", "", disease))
+  if (!dir.exists(disease.dir)) {
+    dir.create(disease.dir, recursive = TRUE)
+  }
+  if (adjusted) {
+    tcga.data <- tcga.adjusted
+    lines.filename <- paste0(disease.dir, "/CCLE-lines-TCGA-adjusted.pdf")
+    lines.title <- paste("Correlation between adjusted TCGA", disease,
+                         "and CCLE", disease)
+    sites.filename <- paste0(disease.dir, "/CCLE-sites-TCGA-adjusted.pdf")
+  } else {
+    tcga.data <- tcga.corrected
+    lines.filename <- paste0(disease.dir, "/CCLE-lines-TCGA-unadjusted.pdf")
+    lines.title <- paste("Correlation between unadjusted TCGA", disease,
+                         "and CCLE", disease)
+    sites.filename <- paste0(disease.dir, "/CCLE-sites-TCGA-unadjusted.pdf")
+  }
+  tcga.filtered <- tcga.data[, tcga.annotations[
+    colnames(tcga.data), "Disease"] == disease]
+  correlation <- cor(cbind(ccle.normalized, tcga.filtered), method = "spearman")
+  correlation <- correlation[colnames(ccle.normalized), colnames(tcga.filtered)]
+  correlation.melted <- melt(correlation)
+  correlation.melted$primary.site <- ccle.annotations[
+    as.character(correlation.melted$Var1), "Site_Primary"]
+  correlation.melted$tcga.code <- ccle.annotations[
+    as.character(correlation.melted$Var1), "tcga_code"]
+  
+  # Per cell line
+  correlation.order <- order(apply(correlation, 1, median), decreasing = TRUE)
+  correlation.melted$cell.line.name.ordered <- factor(
+    ccle.annotations[as.character(correlation.melted$Var1), "Name"],
+    levels = ccle.annotations[rownames(correlation)[correlation.order], "Name"]
+  )
+  # Limit cell lines to the cancer type
+  correlation.filtered <- correlation.melted %>%
+    filter(!is.na(tcga.code) & tcga.code == disease)
+  pdf(lines.filename)
+  print(ggplot(data = correlation.filtered,
+               aes(x = cell.line.name.ordered, y = value)) +
+    geom_violin() +
+    geom_boxplot() +
+    theme_bw() +
+    theme(axis.text.x = element_text(size = 5, angle = 90,
+                                     vjust = 0.5, hjust = 1)) +
+    labs(x = "Cell line", y = "Correlation", title = lines.title))
+  dev.off()
+  
+  # Per primary site
+  # TODO
+  
+  # Heatmap
+  # TODO
+}
+```
+```{r}
+ccle.diseases <- ccle.annotations[colnames(ccle.normalized), "tcga_code"]
+tcga.before.diseases <- tcga.annotations[colnames(tcga.corrected), "Disease"]
+tcga.after.diseases <- tcga.annotations[colnames(tcga.adjusted), "Disease"]
+for (disease in intersect(ccle.diseases, tcga.before.diseases)) {
+  correlate.disease(disease, adjusted = FALSE)
+}
+for (disease in intersect(ccle.diseases, tcga.after.diseases)) {
+  correlate.disease(disease, adjusted = TRUE)
+}
+```
+```{r}
+correlation <- readRDS("correlation-CCLE-after.rds")
+correlation.melted <- melt(correlation)
+correlation.melted$ccle.disease <- ccle.annotations[
+  as.character(correlation.melted$Var1), "tcga_code"]
+correlation.melted$tcga.disease <- tcga.annotations[
+  as.character(correlation.melted$Var2), "Disease"]
+
+ccle.diseases <- ccle.annotations[colnames(ccle.normalized), "tcga_code"]
+tcga.diseases <- tcga.annotations[colnames(tcga.adjusted), "Disease"]
+intersect.diseases <- intersect(ccle.diseases, tcga.diseases)
+disease.count <- data.frame(row.names = intersect.diseases)
+for (disease in intersect.diseases) {
+  correlation.cell.line <- correlation.melted %>%
+    filter(!is.na(ccle.disease) & ccle.disease == disease &
+             tcga.disease == disease) %>%
+    group_by(Var1) %>%
+    summarize(median.correlation = median(value))
+  disease.count[disease, "total"] <- nrow(correlation.cell.line)
+  disease.count[disease, "strong"] <- sum(
+    correlation.cell.line$median.correlation >= 0.45
+  )
+}
+
+disease.count[order(disease.count$strong, decreasing = TRUE), ]
+```
+
+### Heatmap
+```{r}
+correlation.heatmap <- function(x, name, keep.intersect = TRUE,
+                                text.size = 8,
+                                title = NA) {
+  intersect.diseases <- sort(intersect(rownames(x), colnames(x)))
+  if (keep.intersect) {
+    x <- x[intersect.diseases, intersect.diseases]
+  } else {
+    x <- x[order(rownames(x) %in% intersect.diseases, decreasing = TRUE),
+           order(colnames(x) %in% intersect.diseases, decreasing = TRUE)]
+  }
+
+  p.order <- pheatmap(x,
+                      # Rows are CCLE
+                      cluster_rows = TRUE, cluster_cols = FALSE)
+  x <- x[, p.order$tree_row[["order"]]]
+  p <- pheatmap(x,
+                color = inferno(100),
+                border_color = NA,
+                cellwidth = 10, cellheight = 10,
+                # Rows are CCLE
+                cluster_rows = TRUE, cluster_cols = FALSE,
+                main = title,
+                fontsize = text.size)
+
+  if (!dir.exists("plots/correlation")) {
+    dir.create("plots/correlation", recursive = TRUE)
+  }
+  pdf(paste0("plots/correlation/", name, ".pdf"))
+  print(p)
+  dev.off()
+  return(p)
+}
+
+median.correlation.disease <- function(correlation) {
+  correlation.melted <- melt(correlation)
+  correlation.melted$ccle.disease <- ccle.annotations[
+    as.character(correlation.melted$Var1), "tcga_code"]
+  correlation.melted$tcga.disease <- tcga.annotations[
+    as.character(correlation.melted$Var2), "Disease"]
+  
+  return(correlation.melted %>%
+    group_by(ccle.disease, tcga.disease) %>%
+    summarize(median.correlation = median(value)) %>%
+    acast(ccle.disease ~ tcga.disease, value.var = "median.correlation"))
+}
+```
+```{r}
+ccle.before.correlation <- readRDS("correlation-CCLE-before.rds")
+correlation.heatmap(
+  median.correlation.disease(ccle.before.correlation),
+  "CCLE-before",
+  # axis.title.x = "TCGA",
+  # axis.title.y = "CCLE",
+  title = "Median correlation between CCLE and unadjusted TCGA"
+)
+```
+```{r}
+ccle.after.correlation <- readRDS("correlation-CCLE-after.rds")
+correlation.heatmap(
+  median.correlation.disease(ccle.after.correlation),
+  "CCLE-after",
+  # axis.title.x = "TCGA",
+  # axis.title.y = "CCLE",
+  title = "Median correlation between CCLE and adjusted TCGA"
+)
+```
+
+# Correlation by Adjustment
+```{r}
+fisher.z <- function(x) (log(1 + x) - log(1 - x)) / 2
+
+coefficients.by.disease <- function(adjusted = TRUE) {
+  if (adjusted) {
+    correlation <- readRDS("correlation-CCLE-after.rds")
+  } else {
+    correlation <- readRDS("correlation-CCLE-before.rds")
+  }
+  correlation.melted <- melt(correlation)
+  correlation.melted$cell.line <- as.character(correlation.melted$Var1)
+  correlation.melted$barcode <- as.character(correlation.melted$Var2)
+  correlation.melted$z <- fisher.z(correlation.melted$value)
+  correlation.melted$ccle.disease <- ccle.annotations[
+    correlation.melted$cell.line, "tcga_code"
+  ]
+  correlation.melted$tcga.disease <- tcga.annotations[
+    correlation.melted$barcode, "Disease"
+  ]
+  
+  correlation.melted <- correlation.melted %>% filter(
+    !is.na(ccle.disease) & ccle.disease == tcga.disease
+  )
+  correlation.melted$disease <- correlation.melted$ccle.disease
+  
+  return(correlation.melted)
+}
+```
+```{r}
+correlation.before <- coefficients.by.disease(adjusted = FALSE)
+correlation.after <- coefficients.by.disease(adjusted = TRUE)
+```
+```{r}
+# Adapted from https://stackoverflow.com/questions/35717353/split-violin-plot-with-ggplot2
+GeomSplitViolin <- ggproto("GeomSplitViolin", GeomViolin, 
+                           draw_group = function(self, data, ..., draw_quantiles = NULL) {
+  data <- transform(data, xminv = x - violinwidth * (x - xmin), xmaxv = x + violinwidth * (xmax - x))
+  grp <- data[1, "group"]
+  newdata <- plyr::arrange(transform(data, x = if (grp %% 2 == 1) xminv else xmaxv), if (grp %% 2 == 1) y else -y)
+  newdata <- rbind(newdata[1, ], newdata, newdata[nrow(newdata), ], newdata[1, ])
+  newdata[c(1, nrow(newdata) - 1, nrow(newdata)), "x"] <- round(newdata[1, "x"])
+
+  if (length(draw_quantiles) > 0 & !scales::zero_range(range(data$y))) {
+    stopifnot(all(draw_quantiles >= 0), all(draw_quantiles <=
+      1))
+    quantiles <- ggplot2:::create_quantile_segment_frame(data, draw_quantiles)
+    quantiles[grp %% 2 + 1, "x"] <- round(quantiles[grp %% 2 + 1, "x"])
+    aesthetics <- data[rep(1, nrow(quantiles)), setdiff(names(data), c("x", "y")), drop = FALSE]
+    aesthetics$alpha <- rep(1, nrow(quantiles))
+    both <- cbind(quantiles, aesthetics)
+    quantile_grob <- GeomPath$draw_panel(both, ...)
+    ggplot2:::ggname("geom_split_violin", grid::grobTree(GeomPolygon$draw_panel(newdata, ...), quantile_grob))
+  }
+  else {
+    ggplot2:::ggname("geom_split_violin", GeomPolygon$draw_panel(newdata, ...))
+  }
+})
+
+geom_split_violin <- function(mapping = NULL, data = NULL, stat = "ydensity", position = "identity", ..., 
+                              draw_quantiles = NULL, trim = TRUE, scale = "area", na.rm = FALSE, 
+                              show.legend = NA, inherit.aes = TRUE) {
+  layer(data = data, mapping = mapping, stat = stat, geom = GeomSplitViolin, 
+        position = position, show.legend = show.legend, inherit.aes = inherit.aes, 
+        params = list(trim = trim, scale = scale, draw_quantiles = draw_quantiles, na.rm = na.rm, ...))
+}
+```
+```{r}
+correlation.before$adjusted <- "Unadjusted"
+correlation.after$adjusted <- "Adjusted"
+correlation.combined <- rbind(correlation.before, correlation.after) %>%
+  filter(disease != "GBM")
+correlation.combined$adjusted <- factor(correlation.combined$adjusted,
+                                        levels = c("Unadjusted", "Adjusted"))
+
+p.values <- NULL
+for (compare.disease in unique(correlation.combined$disease)) {
+  correlate.disease <- correlation.combined %>%
+    filter(disease == compare.disease)
+  p.value <- t.test(z ~ adjusted, data = correlate.disease)$p.value
+  p.values <- c(p.values, p.value)
+}
+fdr <- p.adjust(p.values, "fdr")
+labels <- NULL
+for (r in fdr) {
+  if (r == 1.0) labels <- c(labels, "")
+  else if (r > 0.05) labels <- c(labels, "ns")
+  else if (r > 0.01) labels <- c(labels, "*")
+  else if (r > 0.001) labels <- c(labels, "**")
+  else if (r > 0.0001) labels <- c(labels, "***")
+  else labels <- c(labels, "****")
+}
+# p.values <- format(p.values, trim = TRUE, digits = 2)
+
+p <- ggplot(data = correlation.combined,
+            aes(x = disease, y = z, fill = adjusted)) +
+  geom_split_violin(draw_quantiles = 0.5) +
+  # geom_violin(data = correlation.combined %>% filter(disease == "GBM"),
+  #             aes(fill = "Unadjusted"), draw_quantiles = 0.5) +
+  # annotate("text",
+  #          x = c(1.3, 2:21, 21.7), y = rep(c(0.75, 0.77), 11),
+  #          label = p.values, size = 2.2) +
+  annotate("text", x = 1:22, y = 0.875, label = p.values, size = 3) +
+  # geom_boxplot() +
+  ylim(0, 1) +
+  theme_bw() +
+  theme(axis.text.x = element_text(size = 10, angle = 90,
+                                   vjust = 0.5, hjust = 1)) +
+  labs(fill = "TCGA",
+       x = "Tumor type", y = "Fisher-transformed correlation",
+       title = "Correlation between CCLE and TCGA")
+
+if (!dir.exists("plots/correlation")) {
+  dir.create("plots/correlation", recursive = TRUE)
+}
+pdf("plots/correlation/by-adjustment.pdf")
+print(p)
+dev.off()
+
+p
+```
+
+# Cell Line Rank Comparison
+```{r}
+mirna.mrna.diseases <- c("BLCA", "BRCA", "COAD/READ", "DLBC", "ESCA", "GBM",
+                         "HNSC", "KIRC", "LAML", "LGG", "LIHC", "LUAD", "LUSC",
+                         "MESO", "OV", "PAAD", "PRAD", "SKCM", "STAD", "THCA",
+                         "UCEC")
+
+# compare.rank <- function(adjusted = TRUE) {
+#   if (adjusted) {
+#     mirna.correlation.all <- readRDS("correlation-CCLE-after.rds")
+#   } else {
+#     mirna.correlation.all <- readRDS("correlation-CCLE-before.rds")
+#   }
+#   rename.cell.line <- function(x) gsub("_.*", "", x)
+#   # rename.barcode <- function(x) substr(x, 1, 15)
+#   rownames(mirna.correlation.all) <-
+#     rename.cell.line(rownames(mirna.correlation.all))
+#   # colnames(mirna.correlation.all) <-
+#   #   rename.barcode(colnames(mirna.correlation.all))
+# 
+#   w.values <- list()
+#   for (disease in mirna.mrna.diseases) {
+#     tcga.code <- ccle.annotations[rownames(mirna.correlation.all), "tcga_code"]
+#     mirna.correlation <- mirna.correlation.all[
+#       !is.na(tcga.code) & tcga.code == disease,
+#       tcga.annotations[colnames(mirna.correlation.all), "Disease"] == disease
+#     ]
+# 
+#     # https://github.com/katharineyu/TCGA_CCLE_test
+#     mrna.correlation <- t(read.delim(
+#       paste0("TCGA_CCLE_test/data/Correlation_Matrices/Correlation_Matrix_",
+#              gsub("/", "", disease), ".txt"),
+#       row.names = 1
+#     ))
+# 
+#     cell.lines <- intersect(rownames(mirna.correlation),
+#                             rownames(mrna.correlation))
+#     
+#     cell.line.correlation <- as.data.frame(rbind(
+#       t(mirna.correlation[cell.lines, ]),
+#       t(mrna.correlation[cell.lines, ])
+#     ))
+#     cell.line.correlation$rna <- as.factor(c(
+#       rep("mirna", ncol(mirna.correlation)),
+#       rep("mrna", ncol(mrna.correlation))
+#     ))
+#     w.values.disease <- c()
+#     for (cell.line in cell.lines) {
+#       w.value <- wilcox.test(cell.line.correlation[, cell.line] ~ rna,
+#                              data = cell.line.correlation)$p.value
+#       w.values.disease[cell.line] <- w.value
+#     }
+#     w.values[[disease]] <- w.values.disease
+#   }
+#   return(w.values)
+# }
+
+compare.cor.rank <- function(adjusted = TRUE) {
+  if (adjusted) {
+    mirna.correlation.all <- readRDS("correlation-CCLE-after.rds")
+  } else {
+    mirna.correlation.all <- readRDS("correlation-CCLE-before.rds")
+  }
+  rename.cell.line <- function(x) gsub("_.*", "", x)
+  rename.barcode <- function(x) substr(x, 1, 15)
+  rownames(mirna.correlation.all) <-
+    rename.cell.line(rownames(mirna.correlation.all))
+  colnames(mirna.correlation.all) <-
+    rename.barcode(colnames(mirna.correlation.all))
+
+  spearman.coefficients <- list()
+  wilcox.p.values <- list()
+  for (disease in mirna.mrna.diseases) {
+    tcga.code <- ccle.annotations[rownames(mirna.correlation.all), "tcga_code"]
+    mirna.correlation <- mirna.correlation.all[
+      !is.na(tcga.code) & tcga.code == disease,
+      tcga.annotations[colnames(mirna.correlation.all), "Disease"] == disease
+    ]
+
+    # https://github.com/katharineyu/TCGA_CCLE_test
+    mrna.correlation <- t(read.delim(
+      paste0("TCGA_CCLE_test/data/Correlation_Matrices/Correlation_Matrix_",
+             gsub("/", "", disease), ".txt"),
+      row.names = 1
+    ))
+
+    cell.lines <- intersect(rownames(mirna.correlation),
+                            rownames(mrna.correlation))
+    barcodes <- intersect(colnames(mirna.correlation),
+                          colnames(mrna.correlation))
+
+    if (length(cell.lines) == 0) {
+        print(paste(
+          "Overlapping cell lines for", disease, "not found"
+        ))
+        next
+    }
+    if (length(barcodes) == 0) {
+        print(paste(
+          "Overlapping barcodes for", disease, "not found"
+        ))
+        next
+    }
+
+    coefficients.disease <- NULL
+    wilcox.p.values.disease <- NULL
+    for (cell.line in cell.lines) {
+      coefficient <- cor(mirna.correlation[cell.line, barcodes],
+                         mrna.correlation[cell.line, barcodes],
+                         method = "spearman")
+      wilcox.p.value <- wilcox.test(mirna.correlation[cell.line, barcodes],
+                                    mrna.correlation[cell.line, barcodes],
+                                    paired = TRUE)$p.value
+      coefficients.disease[cell.line] <- coefficient
+      wilcox.p.values.disease[cell.line] <- wilcox.p.value
+    }
+    spearman.coefficients[[disease]] <- coefficients.disease
+    wilcox.p.values[[disease]] <- wilcox.p.values.disease
+  }
+  return(list(spearman = spearman.coefficients, wilcox = wilcox.p.values))
+}
+```
+
+## Spearman Coefficient Plot
+```{r}
+violin.mirna.mrna.spearman <- function(adjusted = TRUE) {
+  if (adjusted) {
+    filename <- "plots/miRNA-mRNA/spearman-adjusted.pdf"
+  } else {
+    filename <- "plots/miRNA-mRNA/spearman-unadjusted.pdf"
+  }
+
+  results <- compare.cor.rank(adjusted = adjusted)
+  spearman.coefficients <- results$spearman
+
+  correlation <- data.frame()
+  for (disease in names(spearman.coefficients)) {
+    for (cell.line in names(spearman.coefficients[[disease]])) {
+      correlation[cell.line, "correlation"] <-
+        spearman.coefficients[[disease]][cell.line]
+      correlation[cell.line, "disease"] <- disease
+    }
+  }
+
+  disease.order <- rev(order(
+    (correlation %>%
+       group_by(disease) %>%
+       summarize(median.correlation = median(correlation)))$median.correlation
+  ))
+  correlation$disease <- factor(
+    correlation$disease,
+    levels = names(spearman.coefficients)[disease.order]
+  )
+
+  p <- ggplot(data = correlation, aes(x = disease, y = correlation)) +
+    geom_violin(position = "dodge") +
+    geom_boxplot(width = 0.25, position = "dodge") +
+    theme_bw() +
+    theme(axis.text.x = element_text(size = 10, angle = 90,
+                                     vjust = 0.5, hjust = 1)) +
+    labs(x = "Tumor type", y = "Correlation",
+         title = paste("Correlation between miRNA and mRNA",
+                       "spearman coefficients by cell line"))
+
+  if (!dir.exists("plots/miRNA-mRNA")) {
+    dir.create("plots/miRNA-mRNA", recursive = TRUE)
+  }
+  pdf(filename)
+  print(p)
+  dev.off()
+  return(p)
+}
+```
+```{r}
+violin.mirna.mrna.spearman(adjusted = FALSE)
+```
+```{r}
+violin.mirna.mrna.spearman(adjusted = TRUE)
+```
+
+# MiRNA-mRNA Target Matrices
+```{r}
+target.matrices <- function(mirna.data, mrna.data,
+                            mirna.diseases, mrna.diseases,
+                            barcode.substring = TRUE) {
+  # Take intersection the two matrices
+  mirna <- intersect(rownames(targetscan.matrix), rownames(mirna.data))
+  mrna <- intersect(colnames(targetscan.matrix), rownames(mrna.data))
+
+  targetscan.matrix.filtered <- targetscan.matrix[mirna, mrna]
+
+  strong.negative.targets <- list()
+  for (disease in sort(intersect(mirna.diseases, mrna.diseases))) {
+    print(paste("Calculating", disease))
+
+    mirna.samples.all <- colnames(mirna.data)[!is.na(mirna.diseases) &
+                                                mirna.diseases == disease]
+    mrna.samples.all <- colnames(mrna.data)[!is.na(mrna.diseases) &
+                                              mrna.diseases == disease]
+
+    if (barcode.substring) {
+      barcodes.short <- intersect(substr(mirna.samples.all, 1, 15),
+                                  substr(mrna.samples.all, 1, 15))
+      mirna.samples <- mirna.samples.all[
+        match(barcodes.short, substr(mirna.samples.all, 1, 15))
+      ]
+      mrna.samples <- mrna.samples.all[
+        match(barcodes.short, substr(mrna.samples.all, 1, 15))
+      ]
+    } else {
+      mirna.samples <- mrna.samples <-
+        intersect(mirna.samples.all, mrna.samples.all)
+    }
+
+    mirna.filtered <- mirna.data[mirna, mirna.samples]
+    mrna.filtered <- mrna.data[mrna, mrna.samples]
+  
+    correlation <- cor(t(rbind(mirna.filtered, mrna.filtered)),
+                       method = "pearson")
+    correlation <- correlation[mirna, mrna]
+    fdr <- p.adjust(
+      # p-value
+      2 * pnorm(-abs(
+        # z-score
+        sqrt(length(barcodes.short) - 3) * (
+          # Fisher
+          (log(1 + correlation) - log(1 - correlation)) / 2
+        )
+      )),
+      "fdr"
+    )
+    dim(fdr) <- c(length(mirna), length(mrna))
+
+    strong.negative.targets[[disease]] <- 
+      targetscan.matrix.filtered & correlation < 0 & fdr < 0.05
+  }
+
+  return(strong.negative.targets)
+}
+```
+```{r}
+tcga.targets <- target.matrices(
+  tcga.adjusted, tcga.mrna.adjusted,
+  tcga.annotations[colnames(tcga.adjusted), "Disease"],
+  tcga.disease.map[colnames(tcga.mrna.adjusted)],
+  barcode.substring = TRUE
+)
+saveRDS(tcga.targets, file = "TCGA-target-matrices.rds")
+```
+```{r}
+ccle.targets <- target.matrices(
+  ccle.normalized, ccle.mrna.normalized,
+  as.character(ccle.annotations[colnames(ccle.normalized), "tcga_code"]),
+  as.character(ccle.annotations[colnames(ccle.mrna.normalized), "tcga_code"]),
+  barcode.substring = FALSE
+)
+saveRDS(ccle.targets, file = "CCLE-target-matrices.rds")
+```
+
+## Network Analysis
+```{r}
+targets.to.networks <- function(targets) {
+  networks <- list()
+  for (disease in names(targets)) {
+    edges <- melt(targets[[disease]]) %>%
+      filter(value) %>%
+      transmute(from = Var1, to = Var2)
+    networks[[disease]] <- graph_from_data_frame(
+      edges, directed = TRUE,
+      vertices = c(rownames(targets[[disease]]), colnames(targets[[disease]]))
+    )
+  }
+  return(networks)
+}
+
+ccle.targets <- readRDS("CCLE-target-matrices.rds")
+tcga.targets <- readRDS("TCGA-target-matrices.rds")
+ccle.networks <- targets.to.networks(ccle.targets)
+tcga.networks <- targets.to.networks(tcga.targets)
+```
+
+### Degree Distribution
+```{r}
+# diseases <- intersect(names(ccle.networks), names(tcga.networks))
+diseases <- c("LUAD", "COAD/READ", "BRCA", "SKCM", "STAD", "HNSC", "SARC")
+median.mean.degree <- data.frame(row.names = diseases)
+for (disease in diseases) {
+  ccle.degrees <- data.frame(degree = degree(
+    ccle.networks[[disease]],
+    v = rownames(ccle.targets[[disease]])
+  ))
+  ccle.degrees$dataset <- "CCLE"
+  tcga.degrees <- data.frame(degree = degree(
+    tcga.networks[[disease]],
+    v = rownames(tcga.targets[[disease]])
+  ))
+  tcga.degrees$dataset <- "TCGA"
+
+  median.mean.degree[disease, "ccle.median"] <- median(ccle.degrees$degree)
+  median.mean.degree[disease, "ccle.mean"] <- mean(ccle.degrees$degree)
+  median.mean.degree[disease, "tcga.median"] <- median(tcga.degrees$degree)
+  median.mean.degree[disease, "tcga.mean"] <- mean(tcga.degrees$degree)
+
+  p <- ggplot(data = rbind(ccle.degrees, tcga.degrees)) +
+    geom_bar(mapping = aes(x = degree), width = 1) +
+    facet_grid(dataset ~ .) +
+    # scale_x_continuous(limits = c(-1, 20)) +
+    theme_bw() +
+    theme(plot.title = element_text(size = 12, hjust = 0.5),
+          axis.text.x = element_text(size = 10)) +
+    labs(x = "Degree", y = "Count",
+         title = paste(disease,
+                       "degree distribution of CCLE and TCGA networks"))
+  if (!dir.exists("plots/network/degree")) {
+    dir.create("plots/network/degree", recursive = TRUE)
+  }
+  pdf(paste0("plots/network/degree/", gsub("/", "", disease), ".pdf"))
+  print(p)
+  dev.off()
+  print(p)
+}
+median.mean.degree
+```
+
+### miRNA Hub Score
+```{r}
+# diseases <- intersect(names(ccle.networks), names(tcga.networks))
+diseases <- c("LUAD", "COAD/READ", "BRCA", "SKCM", "STAD", "HNSC", "SARC")
+correlations <- data.frame(disease = diseases, row.names = diseases)
+for (disease in diseases) {
+  correlations[disease, "correlation"] <- cor(
+    hub_score(ccle.networks[[disease]])$vector[
+      rownames(ccle.targets[[disease]])],
+    hub_score(tcga.networks[[disease]])$vector[
+      rownames(tcga.targets[[disease]])],
+    method = "pearson"
+  )
+}
+correlations$disease <- factor(
+  correlations$disease,
+  levels = correlations$disease[order(correlations$correlation,
+                                      decreasing = TRUE)]
+)
+
+p <- ggplot(data = correlations, aes(x = disease, y = correlation)) +
+  geom_point() +
+  ylim(0, 1) +
+  theme_bw() +
+  theme(plot.title = element_text(size = 12, hjust = 0.5),
+        axis.text.x = element_text(size = 10,
+                                   angle = 90, vjust = 0.5, hjust = 1)) +
+  labs(x = NULL, y = "Pearson correlation coefficient",
+       title = "Hub score correlation between CCLE and TCGA networks")
+if (!dir.exists("plots/network")) {
+  dir.create("plots/network", recursive = TRUE)
+}
+pdf("plots/network/hub.pdf")
+print(p)
+dev.off()
+p
+```
+
+### Hamming Distance
+```{r}
+# diseases <- intersect(names(ccle.networks), names(tcga.networks))
+diseases <- c("LUAD", "COAD/READ", "BRCA", "SKCM", "STAD", "HNSC", "SARC")
+distances <- data.frame(disease = diseases, row.names = diseases)
+for (disease in diseases) {
+  distances[disease, "distance"] <- sum(
+    as_adjacency_matrix(ccle.networks[[disease]]) !=
+      as_adjacency_matrix(tcga.networks[[disease]])
+  )
+}
+distances$disease <- factor(
+  distances$disease,
+  levels = distances$disease[order(distances$distance, decreasing = FALSE)]
+)
+
+p <- ggplot(data = distances, aes(x = disease, y = distance)) +
+  geom_point() +
+  scale_y_continuous(labels = function(x) format(x, big.mark = ",",
+                                                 scientific = FALSE),
+                     limits = c(0, NA)) +
+  theme_bw() +
+  theme(plot.title = element_text(size = 12, hjust = 0.5),
+        axis.text.x = element_text(size = 10,
+                                   angle = 90, vjust = 0.5, hjust = 1)) +
+  labs(x = NULL, y = "Hamming distance",
+       title = "Hamming distance between CCLE and TCGA networks")
+if (!dir.exists("plots/network")) {
+  dir.create("plots/network", recursive = TRUE)
+}
+pdf("plots/network/hamming.pdf")
+print(p)
+dev.off()
+p
+```
+
+### Fisher Exact Test
+```{r}
+diseases <- intersect(names(ccle.networks), names(tcga.networks))
+# diseases <- c("LUAD", "COAD/READ", "BRCA", "SKCM", "STAD", "HNSC", "SARC")
+for (disease in diseases) {
+  genes <- rownames(ccle.targets[[disease]])
+  p.values <- data.frame(gene = genes, row.names = genes)
+  for (mirna in genes) {
+    contingency <- table(
+      factor(ccle.targets[[disease]][mirna, ], levels = c(TRUE, FALSE)),
+      factor(tcga.targets[[disease]][mirna, ], levels = c(TRUE, FALSE))
+    )
+    p.value <- fisher.test(contingency, alternative = "greater")$p.value
+    p.values[mirna, "p.value"] <- p.value
+    p.values[mirna, "tt"] <- contingency[1, 1]
+    p.values[mirna, "tf"] <- contingency[1, 2]
+    p.values[mirna, "ft"] <- contingency[2, 1]
+    p.values[mirna, "ff"] <- contingency[2, 2]
+  }
+  p.values$fdr <- p.adjust(p.values$p.value, "fdr")
+
+  num.hubs <- 5
+  hub.names <- as.character(p.values$gene[order(p.values$fdr)[1:num.hubs]])
+  hub.mrna.names <- c(hub.names, colnames(ccle.targets[[disease]]))
+  ccle.genes <- V(ccle.networks[[disease]])
+  ccle.subgraph <- induced_subgraph(
+    ccle.networks[[disease]],
+    ccle.genes[match(hub.mrna.names, names(ccle.genes))]
+  )
+  tcga.genes <- V(tcga.networks[[disease]])
+  tcga.subgraph <- induced_subgraph(
+    tcga.networks[[disease]],
+    tcga.genes[match(hub.mrna.names, names(tcga.genes))]
+  )
+  common.subgraph <- intersection(ccle.subgraph, tcga.subgraph)
+  vertex_attr(common.subgraph, "type") <- c(
+    rep("mirna", num.hubs),
+    rep("mrna", ncol(ccle.targets[[disease]]))
+  )
+  vertex_attr(common.subgraph, "name") <- c(
+    paste0(hub.names, "\n",
+           format(p.values[hub.names, "fdr"], trim = TRUE, digits = 3)),
+    rep("", ncol(ccle.targets[[disease]]))
+  )
+  common.subgraph <- delete_vertices(common.subgraph,
+                                     which(degree(common.subgraph) == 0))
+  p <- ggnet2(
+    common.subgraph,
+    color = "type", color.palette = c("mirna" = "grey50", "mrna" = "grey25"),
+    shape = "type", shape.palette = c("mirna" = 17, "mrna" = 19),
+    size = "degree",
+    label = TRUE, label.size = 3,
+    # arrow.size = 3, arrow.gap = 0.005
+  ) + guides(color = FALSE, shape = FALSE, size = FALSE) +
+    labs(title = paste(
+      disease, "top 5 miRNAs with significant overlap between CCLE and TCGA"
+    ))
+  if (!dir.exists("plots/network/fisher")) {
+    dir.create("plots/network/fisher", recursive = TRUE)
+  }
+  pdf(paste0("plots/network/fisher/", gsub("/", "", disease), ".pdf"))
+  print(p)
+  dev.off()
+  print(p)
+}
+```
